@@ -19,13 +19,11 @@ import math
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
-from tensorflow.contrib.data.python.ops import batching
-#from tensorflow.contrib.data.python.ops import interleave_ops
 from tensorflow.contrib.image.python.ops import distort_image_ops
 from tensorflow.python.layers import utils
 from tensorflow.python.ops import data_flow_ops
-from tensorflow.python.platform import gfile
 import cnn_util
+import data_utils
 
 
 def parse_example_proto(example_serialized):
@@ -99,12 +97,21 @@ def parse_example_proto(example_serialized):
   return features['image/encoded'], label, bbox, features['image/class/text']
 
 
+_RESIZE_METHOD_MAP = {
+    'nearest': tf.image.ResizeMethod.NEAREST_NEIGHBOR,
+    'bilinear': tf.image.ResizeMethod.BILINEAR,
+    'bicubic': tf.image.ResizeMethod.BICUBIC,
+    'area': tf.image.ResizeMethod.AREA
+}
+
+
 def get_image_resize_method(resize_method, batch_position=0):
   """Get tensorflow resize method.
 
-  If method is 'round_robin', return different methods based on batch position
-  in a round-robin fashion. NOTE: If the batch size is not a multiple of the
-  number of methods, then the distribution of methods will not be uniform.
+  If resize_method is 'round_robin', return different methods based on batch
+  position in a round-robin fashion. NOTE: If the batch size is not a multiple
+  of the number of methods, then the distribution of methods will not be
+  uniform.
 
   Args:
     resize_method: (string) nearest, bilinear, bicubic, area, or round_robin.
@@ -113,18 +120,12 @@ def get_image_resize_method(resize_method, batch_position=0):
   Returns:
     one of resize type defined in tf.image.ResizeMethod.
   """
-  resize_methods_map = {
-      'nearest': tf.image.ResizeMethod.NEAREST_NEIGHBOR,
-      'bilinear': tf.image.ResizeMethod.BILINEAR,
-      'bicubic': tf.image.ResizeMethod.BICUBIC,
-      'area': tf.image.ResizeMethod.AREA
-  }
 
   if resize_method != 'round_robin':
-    return resize_methods_map[resize_method]
+    return _RESIZE_METHOD_MAP[resize_method]
 
   # return a resize method based on batch position in a round-robin fashion.
-  resize_methods = resize_methods_map.values()
+  resize_methods = list(_RESIZE_METHOD_MAP.values())
   def lookup(index):
     return resize_methods[index]
 
@@ -171,6 +172,13 @@ def decode_jpeg(image_buffer, scope=None):  # , dtype=tf.float32):
     return image
 
 
+def normalized_image(images):
+  # Rescale from [0, 255] to [0, 2]
+  images = tf.multiply(images, 1. / 127.5)
+  # Rescale to [-1, 1]
+  return tf.subtract(images, 1.0)
+
+
 def eval_image(image,
                height,
                width,
@@ -185,9 +193,6 @@ def eval_image(image,
   resize the image such that the aspect ratio is maintained and the resized
   height and width are both at least 1.15 times `height` and `width`
   respectively. Then, we do a central crop to size (`height`, `width`).
-
-  TODO(b/64579165): Determine if we should use different evaluation
-  prepossessing steps.
 
   Args:
     image: 3-D float Tensor representing the image.
@@ -332,38 +337,26 @@ def train_image(image_buffer,
                                    dct_method='INTEGER_FAST')
       image = tf.slice(image, bbox_begin, bbox_size)
 
-    if distortions:
-      # After this point, all image pixels reside in [0,1]. Before, they were
-      # uint8s in the range [0, 255].
-      image = tf.image.convert_image_dtype(image, dtype=tf.float32)
+    distorted_image = tf.image.random_flip_left_right(image)
 
     # This resizing operation may distort the images because the aspect
     # ratio is not respected.
     image_resize_method = get_image_resize_method(resize_method, batch_position)
-    if cnn_util.tensorflow_version() >= 11:
-      distorted_image = tf.image.resize_images(
-          image, [height, width],
-          image_resize_method,
-          align_corners=False)
-    else:
-      distorted_image = tf.image.resize_images(
-          image,
-          height,
-          width,
-          image_resize_method,
-          align_corners=False)
+    distorted_image = tf.image.resize_images(
+        distorted_image, [height, width],
+        image_resize_method,
+        align_corners=False)
     # Restore the shape since the dynamic slice based upon the bbox_size loses
     # the third dimension.
     distorted_image.set_shape([height, width, 3])
     if summary_verbosity >= 3:
-      tf.summary.image(
-          'cropped_resized_image',
-          tf.expand_dims(distorted_image, 0))
-
-    # Randomly flip the image horizontally.
-    distorted_image = tf.image.random_flip_left_right(distorted_image)
+      tf.summary.image('cropped_resized_maybe_flipped_image',
+                       tf.expand_dims(distorted_image, 0))
 
     if distortions:
+      distorted_image = tf.cast(distorted_image, dtype=tf.float32)
+      # Images values are expected to be in [0,1] for color distortion.
+      distorted_image /= 255.
       # Randomly distort the colors.
       distorted_image = distort_color(distorted_image, batch_position,
                                       distort_color_in_yiq=distort_color_in_yiq)
@@ -432,8 +425,8 @@ def distort_color(image, batch_position=0, distort_color_in_yiq=False,
     return image
 
 
-class RecordInputImagePreprocessor(object):
-  """Preprocessor for images with RecordInput format."""
+class BaseImagePreprocess(object):
+  """Base class for all image preprocessors."""
 
   def __init__(self,
                height,
@@ -444,10 +437,11 @@ class RecordInputImagePreprocessor(object):
                train,
                distortions,
                resize_method,
-               shift_ratio,
-               summary_verbosity,
-               distort_color_in_yiq,
-               fuse_decode_and_crop):
+               shift_ratio=-1,
+               summary_verbosity=0,
+               distort_color_in_yiq=True,
+               fuse_decode_and_crop=True,
+               depth=3):
     self.height = height
     self.width = width
     self.batch_size = batch_size
@@ -466,6 +460,21 @@ class RecordInputImagePreprocessor(object):
           (self.batch_size, self.num_splits))
     self.batch_size_per_split = self.batch_size // self.num_splits
     self.summary_verbosity = summary_verbosity
+    self.depth = depth
+
+  def preprocess(self, image_buffer, bbox, batch_position):
+    raise NotImplementedError('Must be implemented by subclass.')
+
+  def minibatch(self, dataset, subset, use_datasets, cache_data,
+                shift_ratio):
+    raise NotImplementedError('Must be implemented by subclass.')
+
+  def supports_datasets(self):
+    return False
+
+
+class RecordInputImagePreprocessor(BaseImagePreprocess):
+  """Preprocessor for images with RecordInput format."""
 
   def preprocess(self, image_buffer, bbox, batch_position):
     """Preprocessing image_buffer as a function of its batch position."""
@@ -485,7 +494,8 @@ class RecordInputImagePreprocessor(object):
 
     # image = tf.cast(image, tf.uint8) # HACK TESTING
 
-    return image
+    normalized = normalized_image(image)
+    return tf.cast(normalized, self.dtype)
 
   def parse_and_preprocess(self, value, batch_position):
     image_buffer, label_index, bbox, _ = parse_example_proto(value)
@@ -501,30 +511,9 @@ class RecordInputImagePreprocessor(object):
       images = [[] for _ in range(self.num_splits)]
       labels = [[] for _ in range(self.num_splits)]
       if use_datasets:
-        glob_pattern = dataset.tf_record_pattern(subset)
-        file_names = gfile.Glob(glob_pattern)
-        if not file_names:
-          raise ValueError('Found no files in --data_dir matching: {}'
-                           .format(glob_pattern))
-        ds = tf.data.TFRecordDataset.list_files(file_names)
-        ds = ds.apply(
-            interleave_ops.parallel_interleave(
-                tf.data.TFRecordDataset, cycle_length=10))
-        if cache_data:
-          ds = ds.take(1).cache().repeat()
-        counter = tf.data.Dataset.range(self.batch_size)
-        counter = counter.repeat()
-        ds = tf.data.Dataset.zip((ds, counter))
-        ds = ds.prefetch(buffer_size=self.batch_size)
-        ds = ds.shuffle(buffer_size=10000)
-        ds = ds.repeat()
-        ds = ds.apply(
-            batching.map_and_batch(
-                map_func=self.parse_and_preprocess,
-                batch_size=self.batch_size_per_split,
-                num_parallel_batches=self.num_splits))
-        ds = ds.prefetch(buffer_size=self.num_splits)
-        ds_iterator = ds.make_one_shot_iterator()
+        ds_iterator = data_utils.create_iterator(
+            self.batch_size, self.num_splits, self.batch_size_per_split,
+            self.parse_and_preprocess, dataset, subset, self.train, cache_data)
         for d in xrange(self.num_splits):
           labels[d], images[d] = ds_iterator.get_next()
 
@@ -551,54 +540,40 @@ class RecordInputImagePreprocessor(object):
         if not use_datasets:
           images[split_index] = tf.parallel_stack(images[split_index])
           labels[split_index] = tf.concat(labels[split_index], 0)
-        images[split_index] = tf.cast(images[split_index], self.dtype)
-        depth = 3
         images[split_index] = tf.reshape(
             images[split_index],
-            shape=[self.batch_size_per_split, self.height, self.width, depth])
+            shape=[self.batch_size_per_split, self.height, self.width,
+                   self.depth])
         labels[split_index] = tf.reshape(labels[split_index],
                                          [self.batch_size_per_split])
       return images, labels
 
+  def supports_datasets(self):
+    return True
 
-class Cifar10ImagePreprocessor(object):
+
+class ImagenetPreprocessor(RecordInputImagePreprocessor):
+
+  def preprocess(self, image_buffer, bbox, batch_position):
+    # pylint: disable=g-import-not-at-top
+    try:
+      from official.resnet.imagenet_preprocessing import preprocess_image
+    except ImportError:
+      tf.logging.fatal('Please include tensorflow/models to the PYTHONPATH.')
+      raise
+    if self.train:
+      image = preprocess_image(
+          image_buffer, bbox, self.height, self.width, self.depth,
+          is_training=True)
+    else:
+      image = preprocess_image(
+          image_buffer, bbox, self.height, self.width, self.depth,
+          is_training=False)
+    return tf.cast(image, self.dtype)
+
+
+class Cifar10ImagePreprocessor(BaseImagePreprocess):
   """Preprocessor for Cifar10 input images."""
-
-  def __init__(self,
-               height,
-               width,
-               batch_size,
-               num_splits,
-               dtype,
-               train,
-               distortions,
-               resize_method,
-               shift_ratio,
-               summary_verbosity=0,
-               distort_color_in_yiq=False,
-               fuse_decode_and_crop=False):
-    # Process images of this size. Depending on the model configuration, the
-    # size of the input layer might differ from the original size of 32 x 32.
-    self.height = height or 32
-    self.width = width or 32
-    self.depth = 3
-    self.batch_size = batch_size
-    self.num_splits = num_splits
-    self.dtype = dtype
-    self.train = train
-    self.distortions = distortions
-    self.shift_ratio = shift_ratio
-    del distort_color_in_yiq
-    del fuse_decode_and_crop
-    del resize_method
-    del shift_ratio  # unused, because a RecordInput is not used
-    if self.batch_size % self.num_splits != 0:
-      raise ValueError(
-          ('batch_size must be a multiple of num_splits: '
-           'batch_size %d, num_splits: %d') %
-          (self.batch_size, self.num_splits))
-    self.batch_size_per_split = self.batch_size // self.num_splits
-    self.summary_verbosity = summary_verbosity
 
   def _distort_image(self, image):
     """Distort one image for training a network.
@@ -611,7 +586,7 @@ class Cifar10ImagePreprocessor(object):
     Args:
       image: input image.
     Returns:
-      distored image.
+      distorted image.
     """
     image = tf.image.resize_image_with_crop_or_pad(
         image, self.height + 8, self.width + 8)
@@ -639,7 +614,8 @@ class Cifar10ImagePreprocessor(object):
       image = self._distort_image(raw_image)
     else:
       image = self._eval_image(raw_image)
-    return image
+    normalized = normalized_image(image)
+    return tf.cast(normalized, self.dtype)
 
   def minibatch(self, dataset, subset, use_datasets, cache_data,
                 shift_ratio=-1):
@@ -688,23 +664,8 @@ class Cifar10ImagePreprocessor(object):
       return images, labels
 
 
-class SyntheticImagePreprocessor(object):
+class SyntheticImagePreprocessor(BaseImagePreprocess):
   """Preprocessor used for images and labels."""
-
-  def __init__(self, height, width, batch_size, num_splits,
-               dtype, train, distortions, resize_method, shift_ratio,
-               summary_verbosity, distort_color_in_yiq=False,
-               fuse_decode_and_crop=False):
-    del train, distortions, resize_method, summary_verbosity
-    del distort_color_in_yiq
-    del fuse_decode_and_crop
-    self.batch_size = batch_size
-    self.height = height
-    self.width = width
-    self.depth = 3
-    self.dtype = dtype
-    self.num_splits = num_splits
-    self.shift_ratio = shift_ratio
 
   def minibatch(self, dataset, subset, use_datasets, cache_data,
                 shift_ratio=-1):
@@ -736,7 +697,7 @@ class SyntheticImagePreprocessor(object):
     return images_splits, labels_splits
 
 
-class TestImagePreprocessor(object):
+class TestImagePreprocessor(BaseImagePreprocess):
   """Preprocessor used for testing.
 
   set_fake_data() sets which images and labels will be output by minibatch(),
@@ -759,25 +720,26 @@ class TestImagePreprocessor(object):
                summary_verbosity=0,
                distort_color_in_yiq=False,
                fuse_decode_and_crop=False):
-    del height, width, train, distortions, resize_method
-    del summary_verbosity, fuse_decode_and_crop, distort_color_in_yiq
-    self.batch_size = batch_size
-    self.num_splits = num_splits
-    self.dtype = dtype
+    super(TestImagePreprocessor, self).__init__(
+        height, width, batch_size, num_splits, dtype, train, distortions,
+        resize_method, shift_ratio, summary_verbosity=summary_verbosity,
+        distort_color_in_yiq=distort_color_in_yiq,
+        fuse_decode_and_crop=fuse_decode_and_crop)
     self.expected_subset = None
-    self.shift_ratio = shift_ratio
 
   def set_fake_data(self, fake_images, fake_labels):
     assert len(fake_images.shape) == 4
     assert len(fake_labels.shape) == 1
-    assert fake_images.shape[0] == fake_labels.shape[0]
-    assert fake_images.shape[0] % self.batch_size == 0
+    num_images = fake_images.shape[0]
+    assert num_images == fake_labels.shape[0]
+    assert num_images % self.batch_size == 0
     self.fake_images = fake_images
     self.fake_labels = fake_labels
 
   def minibatch(self, dataset, subset, use_datasets, cache_data,
-                shift_ratio=-1):
-    del dataset, use_datasets, cache_data, shift_ratio
+                shift_ratio=0):
+    """Get test image batches."""
+    del dataset, use_datasets, cache_data
     if (not hasattr(self, 'fake_images') or
         not hasattr(self, 'fake_labels')):
       raise ValueError('Must call set_fake_data() before calling minibatch '
@@ -785,9 +747,15 @@ class TestImagePreprocessor(object):
     if self.expected_subset is not None:
       assert subset == self.expected_subset
 
+    shift_ratio = shift_ratio or self.shift_ratio
+    fake_images = cnn_util.roll_numpy_batches(self.fake_images, self.batch_size,
+                                              shift_ratio)
+    fake_labels = cnn_util.roll_numpy_batches(self.fake_labels, self.batch_size,
+                                              shift_ratio)
+
     with tf.name_scope('batch_processing'):
       image_slice, label_slice = tf.train.slice_input_producer(
-          [self.fake_images, self.fake_labels],
+          [fake_images, fake_labels],
           shuffle=False,
           name='image_slice')
       raw_images, raw_labels = tf.train.batch(
@@ -804,4 +772,5 @@ class TestImagePreprocessor(object):
         images[split_index] = tf.parallel_stack(images[split_index])
         labels[split_index] = tf.parallel_stack(labels[split_index])
 
-      return images, labels
+      normalized = normalized_image(images)
+      return tf.cast(normalized, self.dtype), labels

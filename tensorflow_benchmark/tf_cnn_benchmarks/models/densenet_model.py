@@ -24,7 +24,7 @@ import tensorflow as tf
 from models import model as model_lib
 
 
-class DensenetCifar10Model(model_lib.Model):
+class DensenetCifar10Model(model_lib.CNNModel):
   """Densenet cnn network configuration."""
 
   def __init__(self, model, layer_counts, growth_rate):
@@ -81,3 +81,15 @@ class DensenetCifar10Model(model_lib.Model):
     boundaries = [x for x in boundaries]
     values = [0.1, 0.01, 0.001, 0.0001]
     return tf.train.piecewise_constant(global_step, boundaries, values)
+
+
+def create_densenet40_k12_model():
+  return DensenetCifar10Model('densenet40_k12', (12, 12, 12), 12)
+
+
+def create_densenet100_k12_model():
+  return DensenetCifar10Model('densenet100_k12', (32, 32, 32), 12)
+
+
+def create_densenet100_k24_model():
+  return DensenetCifar10Model('densenet100_k24', (32, 32, 32), 24)

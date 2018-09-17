@@ -26,7 +26,8 @@ References:
 from models import model
 
 
-class OverfeatModel(model.Model):
+class OverfeatModel(model.CNNModel):
+  """OverfeatModel."""
 
   def __init__(self):
     super(OverfeatModel, self).__init__('overfeat', 231, 32, 0.005)
@@ -43,4 +44,6 @@ class OverfeatModel(model.Model):
     cnn.mpool(2, 2)
     cnn.reshape([-1, 1024 * 6 * 6])
     cnn.affine(3072)
+    cnn.dropout()
     cnn.affine(4096)
+    cnn.dropout()
