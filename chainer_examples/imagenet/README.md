@@ -1,5 +1,13 @@
 # Large Scale ConvNets
 
+## Modifications
+train_imagenet_data_parallel.py script has been modified to run for synthetic data and changes are enclosed within ### Sythetic block
+Only resnet50 model is supported for synthetic data. Note the extra parameters added: --dataset and --samples
+
+```
+python train_imagenet_data_parallel.py --arch resnet50 --dataset synthetic --epoch 30 --loaderjob 10 --samples 10000 --batchsize 128 --test ~/ ~/ -g 0 1 2 3 4 5 6 7
+```
+
 ## Requirements
 
 - Pillow (Pillow requires an external library that corresponds to the image format)

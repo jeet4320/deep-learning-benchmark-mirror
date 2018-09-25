@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Example code of learning a large scale convnet from LSVRC2012 dataset
+"""
+Script has been modified to run for synthetic data and changes are enclosed within ### Sythetic block
+Only resnet50 model is supported for synthetic data
+
+Example code of learning a large scale convnet from LSVRC2012 dataset
 with multiple GPUs using data parallelism.
 
 Prerequisite: To run this example, crop the center of ILSVRC2012 training and
@@ -29,7 +33,10 @@ import nin
 import resnet50
 import train_imagenet
 
-
+### Synthetic
+import dataset
+import report
+###
 def main():
     archs = {
         'alex': alex.Alex,
@@ -69,6 +76,11 @@ def main():
     parser.add_argument('--val_batchsize', '-b', type=int, default=250,
                         help='Validation minibatch size')
     parser.add_argument('--test', action='store_true')
+    ### Synthetic
+    parser.add_argument('--dataset', choices=['real', 'synthetic'], default='real')
+
+    parser.add_argument('--samples', type=int, default=1000)
+    ### 
     parser.set_defaults(test=False)
     args = parser.parse_args()
 
@@ -78,12 +90,24 @@ def main():
         print('Load model from', args.initmodel)
         chainer.serializers.load_npz(args.initmodel, model)
 
-    # Load the datasets and mean file
-    mean = np.load(args.mean)
-    train = train_imagenet.PreprocessedDataset(
-        args.train, args.root, mean, model.insize)
-    val = train_imagenet.PreprocessedDataset(
-        args.val, args.root, mean, model.insize, False)
+    ### Synthetic
+    MODELS = {
+       'resnet50': ((3, 224, 224), 1000, lambda: resnet50.ResNet50())
+    }
+    model_shape, num_classes, model_fn = MODELS[args.arch]
+    dataset_shape = (args.samples,) + model_shape
+    model = model_fn()
+
+    if args.dataset is 'real':
+        # Load the datasets and mean file
+        mean = np.load(args.mean)
+        train = train_imagenet.PreprocessedDataset(
+            args.train, args.root, mean, model.insize)
+        val = train_imagenet.PreprocessedDataset(
+            args.val, args.root, mean, model.insize, False)
+    else:
+        train = dataset.SyntheticDataset(dataset_shape, num_classes)
+    ###
     # These iterators load the images with subprocesses running in parallel to
     # the training/validation.
     devices = tuple(args.gpus)
@@ -93,8 +117,11 @@ def main():
                                                args.batchsize,
                                                n_processes=args.loaderjob)
         for i in chainer.datasets.split_dataset_n_random(train, len(devices))]
-    val_iter = chainer.iterators.MultiprocessIterator(
-        val, args.val_batchsize, repeat=False, n_processes=args.loaderjob)
+    ### Synthetic
+    if args.dataset is 'real':
+        val_iter = chainer.iterators.MultiprocessIterator(
+            val, args.val_batchsize, repeat=False, n_processes=args.loaderjob)
+    ####
 
     # Set up an optimizer
     optimizer = chainer.optimizers.MomentumSGD(lr=0.01, momentum=0.9)
@@ -112,8 +139,11 @@ def main():
         val_interval = 100000, 'iteration'
         log_interval = 1000, 'iteration'
 
-    trainer.extend(extensions.Evaluator(val_iter, model, device=args.gpus[0]),
-                   trigger=val_interval)
+    ### Synthetic
+    if args.dataset is 'real':
+        trainer.extend(extensions.Evaluator(val_iter, model, device=args.gpus[0]),
+                       trigger=val_interval)
+    ###
     trainer.extend(extensions.dump_graph('main/loss'))
     trainer.extend(extensions.snapshot(), trigger=val_interval)
     trainer.extend(extensions.snapshot_object(
@@ -126,8 +156,8 @@ def main():
         'epoch', 'iteration', 'main/loss', 'validation/main/loss',
         'main/accuracy', 'validation/main/accuracy', 'lr'
     ]), trigger=log_interval)
-    trainer.extend(extensions.ProgressBar(update_interval=2))
-
+    #trainer.extend(extensions.ProgressBar(update_interval=2))
+    trainer.extend(report.MetricsReport(parallelism=len(args.gpus), dataset_length=len(train)))
     if args.resume:
         chainer.serializers.load_npz(args.resume, trainer)
 
