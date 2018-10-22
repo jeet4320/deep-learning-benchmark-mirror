@@ -14,6 +14,8 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from torch.autograd import Variable
+
 
 ### Synthetic
 import dataset
@@ -30,6 +32,7 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
+parser.add_argument('--dummy-data', type=int, default=1000, help='number of dummy images')
 parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
                     choices=model_names,
                     help='model architecture: ' +
@@ -79,6 +82,9 @@ def main():
     args = parser.parse_args()
 
     args.distributed = args.world_size > 1
+
+    args.cuda = torch.cuda.is_available()
+
 
     if args.distributed:
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
@@ -143,7 +149,9 @@ def main():
     else:
         model_shape, num_classes, model_fn = MODELS[args.arch]
         dataset_shape = (args.samples,) + model_shape
-        train_dataset = dataset.SyntheticDataset(dataset_shape, num_classes)
+        #train_dataset = dataset.SyntheticDataset(dataset_shape, num_classes)
+        train_dataset = datasets.FakeData(1000, num_classes=1000, transform=transforms.Compose([ transforms.ToTensor() ]))
+        val_dataset = datasets.FakeData(100, num_classes=1000, transform=transforms.Compose([ transforms.ToTensor() ]))
     ###
 
     if args.distributed:
@@ -220,7 +228,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda(non_blocking=True)
+        if args.cuda:
+           target = target.cuda(non_blocking=True)
+  
+        if args.dummy_data:
+           target = Variable(target.long())
 
         # compute output
         output = model(input)
