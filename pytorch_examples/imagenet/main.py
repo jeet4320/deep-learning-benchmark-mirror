@@ -178,16 +178,20 @@ def main():
         return
 
     for epoch in range(args.start_epoch, args.epochs):
-        ### Custom metric
-        epoch_start = time.time()
         if args.distributed:
             train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
+        ### Custom metric
+        epoch_start = time.time()
+
+        # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch)
 
-        # evaluate on validation set
+        ### Custom metric
+        epoch_time = time.time() - epoch_start
+
         if args.dataset is "real":
             prec1 = validate(val_loader, model, criterion)
 
@@ -207,8 +211,6 @@ def main():
             'optimizer' : optimizer.state_dict(),
         }, is_best)
 
-        ### Custom metric
-        epoch_time = time.time() - epoch_start
         print('Epoch: [{}] \t Speed: {image_persec:.3f} samples/sec \t Time cost={time:.3f}'.format(epoch, image_persec = (args.samples/epoch_time), time = epoch_time))
 
 
@@ -218,12 +220,21 @@ def train(train_loader, model, criterion, optimizer, epoch):
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+    ### Added Speed Meter
+    sample_speed = AverageMeter()
 
     # switch to train mode
     model.train()
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
+        ### Calculate sample per second
+        sample_count = input.size(0)
+
+        ### Drop first batch due to slow loading
+        if i == 1:
+            start_epoch = time.time()
+
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -252,15 +263,24 @@ def train(train_loader, model, criterion, optimizer, epoch):
         batch_time.update(time.time() - end)
         end = time.time()
 
+        ### Measure sample speed
+        sample_speed.update(sample_count/batch_time.val)
+
         if i % args.print_freq == 0:
-            print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                  'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
-                  'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5))
+            line_out = ('Epoch: [{0}][{1}/{2}]\t' +
+                'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t' +
+                'Data {data_time.val:.3f} ({data_time.avg:.3f})\t' +
+                'Loss {loss.val:.4f} ({loss.avg:.4f})\t' +
+                'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t' +
+                'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t').format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, top1=top1, top5=top5)
+            
+            ### Only print batch speed for i>0 batches
+            if i != 0:
+                line_out += 'BatchSpeed {sample_speed.val:.3f} ({sample_speed.avg:.3f})'.format(sample_speed=sample_speed)
+
+            print(line_out)
 
 
 def validate(val_loader, model, criterion):
